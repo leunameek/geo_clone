@@ -1,5 +1,7 @@
 using UnityEngine;
 using UnityEngine.InputSystem;
+using UnityEngine.SceneManagement;
+using System.Collections;
 
 public class KinematicController2D : MonoBehaviour
 {
@@ -8,8 +10,18 @@ public class KinematicController2D : MonoBehaviour
     public Vector2 bodyOffset = Vector2.zero;
     public Transform Sprite;
 
+    [Header("Respawn / Death")]
     public Vector2 respawnPoint;
     public bool reloadSceneOnDeath = false;
+    public bool useParticleExplosion = true;
+
+    [Header("Level Complete")]
+    public bool  loadNextSceneOnComplete = false;
+    public string nextSceneName = "";
+    public float suckDuration = 0.6f;
+    public float suckSpinSpeed = 900f;  // deg/s
+    public float suckScaleEnd = 0.1f;   // how small the sprite becomes
+
 
     [Header("Motion")]
     public float gravity = -60f;
@@ -22,9 +34,7 @@ public class KinematicController2D : MonoBehaviour
     public float groundCheckPadding = 0.02f;
 
     [Header("Jump Assist")]
-    [Tooltip("Allows jump input slightly before landing to still trigger a jump.")]
     public float jumpBufferTime = 0.10f;
-    [Tooltip("Allows jump slightly after walking off a ledge.")]
     public float coyoteTime = 0.06f;
 
     private Vector2 velocity;
@@ -34,12 +44,39 @@ public class KinematicController2D : MonoBehaviour
     float jumpBufferCounter = 0f;
     float coyoteCounter = 0f;
 
+    // Death / hazards
+    private bool isDead = false;
+    private float hazardIgnoreUntil = 0f; // realtime-based grace
+
+    // Cached visual (for “faded” bug)
+    private SpriteRenderer spriteRenderer;
+    private Material cachedSpriteMaterial;
+    private bool isCompleting = false;
+    private Color    cachedSpriteColor;
+
     void Awake()
     {
         velocity = Vector2.zero;
         IsGrounded = false;
         if (respawnPoint == Vector2.zero)
             respawnPoint = transform.position;
+
+        if (Sprite)
+        {
+            spriteRenderer = Sprite.GetComponent<SpriteRenderer>();
+            if (spriteRenderer)
+            {
+                cachedSpriteMaterial = spriteRenderer.sharedMaterial;
+                cachedSpriteColor    = spriteRenderer.color;
+            }
+
+            // Guard: warn if Sprite is actually the same GameObject as this controller
+            if (Sprite.gameObject == this.gameObject)
+            {
+                Debug.LogWarning("[KinematicController2D] Sprite references the root player GO. " +
+                                 "We will hide renderers instead of deactivating the GameObject to keep coroutines alive.");
+            }
+        }
     }
 
     Rect PlayerRectAt(Vector2 pos)
@@ -51,19 +88,23 @@ public class KinematicController2D : MonoBehaviour
 
     void Update()
     {
+        if (isDead) return; // keep script active so coroutines run
+
+        if (isCompleting) return;
+
+        // Horizontal run + gravity
         Velocity = new Vector2(moveSpeedX, Velocity.y);
         Velocity = new Vector2(Velocity.x, Velocity.y + gravity * Time.deltaTime);
 
+        // Input
         bool jumpHeld = false;
         bool jumpPressedThisFrame = false;
 
 #if ENABLE_INPUT_SYSTEM
         if (Keyboard.current != null)
         {
-            jumpHeld = Keyboard.current.spaceKey.isPressed ||
-                       Keyboard.current.enterKey.isPressed;
-            jumpPressedThisFrame = Keyboard.current.spaceKey.wasPressedThisFrame ||
-                                   Keyboard.current.enterKey.wasPressedThisFrame;
+            jumpHeld = Keyboard.current.spaceKey.isPressed || Keyboard.current.enterKey.isPressed;
+            jumpPressedThisFrame = Keyboard.current.spaceKey.wasPressedThisFrame || Keyboard.current.enterKey.wasPressedThisFrame;
         }
         if (Mouse.current != null)
         {
@@ -75,15 +116,12 @@ public class KinematicController2D : MonoBehaviour
         jumpPressedThisFrame = Input.GetKeyDown(KeyCode.Space) || Input.GetMouseButtonDown(0) || Input.GetKeyDown(KeyCode.Return);
 #endif
 
-        if (jumpPressedThisFrame)
-            jumpBufferCounter = jumpBufferTime;
-        else
-            jumpBufferCounter = Mathf.Max(0f, jumpBufferCounter - Time.deltaTime);
+        // Jump buffers
+        if (jumpPressedThisFrame) jumpBufferCounter = jumpBufferTime;
+        else jumpBufferCounter = Mathf.Max(0f, jumpBufferCounter - Time.deltaTime);
 
-        if (IsGrounded)
-            coyoteCounter = coyoteTime;
-        else
-            coyoteCounter = Mathf.Max(0f, coyoteCounter - Time.deltaTime);
+        if (IsGrounded) coyoteCounter = coyoteTime;
+        else coyoteCounter = Mathf.Max(0f, coyoteCounter - Time.deltaTime);
 
         bool canJumpNow = IsGrounded || coyoteCounter > 0f;
         bool wantJump = (jumpHeld && canJumpNow) || (jumpBufferCounter > 0f && canJumpNow);
@@ -96,17 +134,22 @@ public class KinematicController2D : MonoBehaviour
             IsGrounded = false;
         }
 
-        if (IsGrounded)
+        // Sprite spinning / snapping
+        if (Sprite)
         {
-            Vector3 Rotation = Sprite.rotation.eulerAngles;
-            Rotation.z = Mathf.Round(Rotation.z / 90f) * 90f;
-            Sprite.rotation = Quaternion.Euler(Rotation);
-        }
-        else
-        {
-            Sprite.Rotate(Vector3.back * 1f);
+            if (IsGrounded)
+            {
+                Vector3 Rotation = Sprite.rotation.eulerAngles;
+                Rotation.z = Mathf.Round(Rotation.z / 90f) * 90f;
+                Sprite.rotation = Quaternion.Euler(Rotation);
+            }
+            else
+            {
+                Sprite.Rotate(Vector3.back * 1f);
+            }
         }
 
+        // Substep move and collide
         int steps = Mathf.Max(1, maxSubsteps);
         float dt = Time.deltaTime / steps;
         if (dt <= 0f) return;
@@ -123,9 +166,17 @@ public class KinematicController2D : MonoBehaviour
 
         transform.position = pos;
 
+        // Hazards (with grace after respawn)
         if (IsTouchingHazard(pos))
         {
             Kill();
+            return;
+        }
+
+                // Level goal
+        if (IsTouchingGoal(pos, out var goalCenter))
+        {
+            StartLevelComplete(goalCenter);
             return;
         }
     }
@@ -238,6 +289,8 @@ public class KinematicController2D : MonoBehaviour
 
     bool IsTouchingHazard(Vector2 pos)
     {
+        if (Time.unscaledTime < hazardIgnoreUntil) return false;
+
         var world = SimplePhysicsWorld2D.Instance;
         if (world == null || world.Hazards.Count == 0) return false;
 
@@ -251,25 +304,281 @@ public class KinematicController2D : MonoBehaviour
         return false;
     }
 
+        bool IsTouchingGoal(Vector2 pos, out Vector2 goalCenter)
+    {
+        goalCenter = Vector2.zero;
+
+        var world = SimplePhysicsWorld2D.Instance;
+        if (world == null || world.Goals.Count == 0) return false;
+
+        Rect playerRect = PlayerRectAt(pos);
+        foreach (var g in world.Goals)
+        {
+            if (g == null) continue;
+            var r = g.WorldRect;
+            if (Overlaps(playerRect, r))
+            {
+                goalCenter = r.center;
+                return true;
+            }
+        }
+        return false;
+    }
+
     void Kill()
     {
-        // Stop motion
+        if (isDead) return;
+        isDead = true;
+
+        // Defensive: keep GO active; we control visibility via renderers
+        SetSpriteVisible(true);
+
         Velocity = Vector2.zero;
         IsGrounded = false;
 
-        if (reloadSceneOnDeath)
+        // Watchdog in case anything stalls before reload/respawn
+        StartCoroutine(DeathWatchdogRealtime(1.2f));
+
+        if (useParticleExplosion)
         {
-            // Simple reload (requires using UnityEngine.SceneManagement;)
-            var s = UnityEngine.SceneManagement.SceneManager.GetActiveScene();
-            UnityEngine.SceneManagement.SceneManager.LoadScene(s.buildIndex);
+            StartCoroutine(ExplosionAndThen());
             return;
         }
 
-        // Teleport to respawn and snap sprite rotation
+        if (reloadSceneOnDeath) ReloadScene();
+        else RespawnAndReset();
+    }
+
+    IEnumerator ExplosionAndThen()
+    {
+        Debug.Log("[Death] ExplosionAndThen started");
+
+        // SAFER: hide renderers (do NOT SetActive(false) on the GO)
+        SetSpriteVisible(false);
+        CreateAndPlayExplosion();
+
+        // Use realtime so it completes even if timeScale == 0
+        yield return new WaitForSecondsRealtime(0.6f);
+
+        Debug.Log("[Death] Explosion wait done");
+
+        try
+        {
+            if (reloadSceneOnDeath) ReloadScene();
+            else RespawnAndReset();
+        }
+        catch (System.Exception e)
+        {
+            Debug.LogError("[Death] ExplosionAndThen exception: " + e.Message);
+            // Fallback
+            if (reloadSceneOnDeath) ReloadScene();
+            else RespawnAndReset();
+        }
+    }
+
+    IEnumerator DeathWatchdogRealtime(float timeoutSeconds)
+    {
+        float start = Time.realtimeSinceStartup;
+        while (isDead && (Time.realtimeSinceStartup - start) < timeoutSeconds)
+            yield return null;
+
+        if (isDead)
+        {
+            Debug.LogWarning("[Death] Watchdog fired -> forcing recovery");
+            if (reloadSceneOnDeath) ReloadScene();
+            else RespawnAndReset();
+        }
+    }
+
+    void ReloadScene()
+    {
+        Debug.Log("[Death] ReloadScene()");
+        try
+        {
+            var s = SceneManager.GetActiveScene();
+            SceneManager.LoadScene(s.buildIndex);
+        }
+        catch (System.Exception e)
+        {
+            Debug.LogError("[Death] Error reloading scene: " + e.Message + " -> Falling back to respawn.");
+            RespawnAndReset();
+        }
+    }
+
+    void RespawnAndReset()
+    {
+        Debug.Log("[Death] RespawnAndReset()");
         transform.position = (Vector3)respawnPoint;
-        var rot = Sprite ? Sprite.rotation.eulerAngles : Vector3.zero;
-        rot.z = Mathf.Round(rot.z / 90f) * 90f;
-        if (Sprite) Sprite.rotation = Quaternion.Euler(rot);
+
+        // Re-show renderers (not SetActive on GO)
+        SetSpriteVisible(true);
+
+        if (spriteRenderer)
+        {
+            // Restore alpha to 1 and previous material (fixes “faded” look)
+            var col = spriteRenderer.color; col.a = 1f; spriteRenderer.color = col;
+
+            if (cachedSpriteMaterial != null)
+                spriteRenderer.sharedMaterial = cachedSpriteMaterial;
+        }
+
+        if (Sprite)
+        {
+            var rot = Sprite.rotation.eulerAngles;
+            rot.z = Mathf.Round(rot.z / 90f) * 90f;
+            Sprite.rotation = Quaternion.Euler(rot);
+        }
+
+        Velocity = Vector2.zero;
+        IsGrounded = false;
+        jumpBufferCounter = 0f;
+        coyoteCounter = 0f;
+
+        // Avoid instant re-death if spawn is near a hazard
+        hazardIgnoreUntil = Time.unscaledTime + 0.25f;
+
+        isDead = false;
+    }
+
+    // ---- Renderer visibility helper (prevents killing coroutines) ----
+    void SetSpriteVisible(bool visible)
+    {
+        if (!Sprite) return;
+        var rends = Sprite.GetComponentsInChildren<Renderer>(true);
+        foreach (var r in rends) r.enabled = visible;
+    }
+
+    void CreateAndPlayExplosion()
+    {
+        GameObject explosionObj = new GameObject("PlayerExplosion");
+        var ps = explosionObj.AddComponent<ParticleSystem>();
+        ps.Stop(true, ParticleSystemStopBehavior.StopEmittingAndClear);
+
+        var main = ps.main;
+        main.duration = 0.6f;
+        main.loop = false;
+        main.startLifetime = 0.5f;
+        main.startSpeed = 8f;
+        main.startSize = 0.3f;
+        main.startColor = Color.yellow;
+        main.gravityModifier = 0.3f;
+        main.maxParticles = 60;
+        main.playOnAwake = false;
+
+        var emission = ps.emission;
+        emission.rateOverTime = 0f;
+        emission.SetBursts(new ParticleSystem.Burst[] { new ParticleSystem.Burst(0.0f, 40, 60, 1, 0.01f) });
+
+        var shape = ps.shape;
+        shape.shapeType = ParticleSystemShapeType.Sphere;
+        shape.radius = 0.2f;
+
+        var colorOverLifetime = ps.colorOverLifetime;
+        colorOverLifetime.enabled = true;
+
+        Gradient gradient = new Gradient();
+        gradient.SetKeys(
+            new GradientColorKey[] {
+                new GradientColorKey(Color.yellow, 0.0f),
+                new GradientColorKey(Color.red, 0.5f),
+                new GradientColorKey(new Color(1f, 0f, 0f, 0f), 1.0f)
+            },
+            new GradientAlphaKey[] {
+                new GradientAlphaKey(1.0f, 0.0f),
+                new GradientAlphaKey(0.0f, 1.0f)
+            }
+        );
+        colorOverLifetime.color = new ParticleSystem.MinMaxGradient(gradient);
+
+        var renderer = explosionObj.GetComponent<ParticleSystemRenderer>();
+        Shader sh = Shader.Find("Universal Render Pipeline/Particles/Unlit");
+        if (sh == null) sh = Shader.Find("Particles/Standard Unlit");
+        if (sh == null) sh = Shader.Find("Sprites/Default");
+        if (sh != null)
+        {
+            var mat = new Material(sh);
+            renderer.material = mat;
+            renderer.material.color = Color.yellow;
+        }
+
+        explosionObj.transform.position = transform.position;
+        ps.Play();
+        Destroy(explosionObj, 1.0f);
+    }
+
+        void StartLevelComplete(Vector2 goalCenter)
+    {
+        if (isCompleting || isDead) return;
+        isCompleting = true;
+
+        // Freeze physics control
+        Velocity = Vector2.zero;
+
+        // UI message
+        if (LevelUI.Instance) LevelUI.Instance.ShowCompleted("¡Nivel Completado!");
+
+        // Suck slightly inside the wall so it feels like an opening
+        Vector2 suckTarget = goalCenter + new Vector2(0.2f, 0f);
+
+        // Use realtime so it works even if timeScale changes
+        StartCoroutine(SuckIntoWallAndFinish(suckTarget));
+    }
+
+    System.Collections.IEnumerator SuckIntoWallAndFinish(Vector2 target)
+    {
+        // Optional: ignore hazards while completing
+        hazardIgnoreUntil = Time.unscaledTime + suckDuration + 0.5f;
+
+        float t = 0f;
+        Vector3 startPos = transform.position;
+        Vector3 startScale = Sprite ? Sprite.localScale : Vector3.one;
+        Vector3 endScale = startScale * suckScaleEnd;
+
+        while (t < suckDuration)
+        {
+            float dt = Time.unscaledDeltaTime;
+            t += dt;
+
+            // Ease-in curve
+            float u = t / suckDuration;
+            u = u * u * (3f - 2f * u); // smoothstep
+
+            // Lerp position
+            transform.position = Vector3.Lerp(startPos, target, u);
+
+            // Spin + shrink sprite
+            if (Sprite)
+            {
+                Sprite.Rotate(Vector3.forward, -suckSpinSpeed * dt, Space.Self);
+                Sprite.localScale = Vector3.Lerp(startScale, endScale, u);
+            }
+
+            yield return null;
+        }
+
+        // Snap to final
+        transform.position = target;
+        if (Sprite)
+        {
+            Sprite.localScale = endScale;
+            var rot = Sprite.rotation.eulerAngles; rot.z = Mathf.Round(rot.z / 90f) * 90f;
+            Sprite.rotation = Quaternion.Euler(rot);
+        }
+
+        // Finish: either next scene or wait a moment then reload/respawn
+        yield return new WaitForSecondsRealtime(0.3f);
+
+        if (loadNextSceneOnComplete && !string.IsNullOrEmpty(nextSceneName))
+        {
+            try { SceneManager.LoadScene(nextSceneName); }
+            catch { /* fallback */ }
+        }
+        else
+        {
+            // If you want to stop here (level editor/testing), just keep the state.
+            // Or reload scene to replay:
+            // SceneManager.LoadScene(SceneManager.GetActiveScene().buildIndex);
+        }
     }
 
 }
